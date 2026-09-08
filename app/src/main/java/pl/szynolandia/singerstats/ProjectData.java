@@ -41,8 +41,9 @@ class LyricLine {
 }
 
 public class ProjectData {
-    int version=5,nextSingerId=4;
-    String audioPath,coverPath,lyricsBorderColor="#ff0050";
+    int version=6,nextSingerId=4;
+    String audioPath,coverPath,lyricsBorderColor="#ff0050",songTitle="";
+    double songDuration=0;
     ArrayList<Singer>singers=new ArrayList<>();
     ArrayList<LyricLine>lyrics=new ArrayList<>();
     ProjectData(){
@@ -51,14 +52,14 @@ public class ProjectData {
         singers.add(new Singer(3,"Razem","#ffe600"));
     }
     JSONObject json() throws JSONException{
-        JSONObject r=new JSONObject();r.put("version",version);r.put("audio_path",audioPath);r.put("next_singer_id",nextSingerId);
+        JSONObject r=new JSONObject();r.put("version",version);r.put("audio_path",audioPath);r.put("next_singer_id",nextSingerId);r.put("song_title",songTitle);r.put("song_duration",songDuration);
         JSONArray s=new JSONArray();for(Singer x:singers)s.put(x.json());r.put("singers",s);
         JSONArray l=new JSONArray();for(LyricLine x:lyrics)l.put(x.json());r.put("lyrics",l);
         JSONObject v=new JSONObject();v.put("cover_image",coverPath);v.put("lyrics_border_color",lyricsBorderColor);r.put("visual",v);
         return r;
     }
     static ProjectData from(JSONObject r){
-        ProjectData p=new ProjectData();p.singers.clear();p.nextSingerId=r.optInt("next_singer_id",4);
+        ProjectData p=new ProjectData();p.singers.clear();p.nextSingerId=r.optInt("next_singer_id",4);p.songTitle=r.optString("song_title",r.optString("title",""));p.songDuration=r.optDouble("song_duration",0);
         String a=r.optString("audio_path","");p.audioPath=a.isEmpty()?null:a;
         JSONArray ss=r.optJSONArray("singers");if(ss!=null)for(int i=0;i<ss.length();i++)p.singers.add(Singer.from(ss.optJSONObject(i)));
         if(p.singers.isEmpty())p.singers.add(new Singer(1,"Wokalista 1","#ff0050"));
