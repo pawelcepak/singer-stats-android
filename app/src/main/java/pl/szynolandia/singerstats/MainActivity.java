@@ -33,7 +33,7 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle b){
         super.onCreate(b);
         LinearLayout root=new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(BG);
-        TextView title=txt("Singer Stats Visualizer 1.5",22); root.addView(title);
+        TextView title=txt("Singer Stats Visualizer 1.7",22); root.addView(title);
         LinearLayout nav=row(); Button a=btn("Projekt"), t=btn("Timing"), v=btn("Podgląd / eksport");
         nav.addView(a); nav.addView(t); nav.addView(v); root.addView(nav);
         ScrollView s=new ScrollView(this); body=new LinearLayout(this); body.setOrientation(LinearLayout.VERTICAL); body.setPadding(14,10,14,25);
@@ -147,6 +147,10 @@ public class MainActivity extends Activity {
         autoProgress=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal); autoProgress.setMax(100); autoProgress.setProgress(0); body.addView(autoProgress);
         auto.setOnClickListener(x->startAutoTiming());
 
+        body.addView(txt("Kalibracja po Auto Timing: jeśli wszystko jest np. 4–5 s za późno, 1 punkt przesunie cały utwór. Jeśli błąd zmienia się z czasem, użyj 2 punktów.",14));
+        LinearLayout cal=row(); Button c1=btn("Kalibracja 1 punkt"), c2=btn("Kalibracja 2 punkty"); cal.addView(c1); cal.addView(c2); body.addView(cal);
+        c1.setOnClickListener(x->showOnePointCalibration()); c2.setOnClickListener(x->showTwoPointCalibration());
+
         body.addView(txt("Po automatycznym dopasowaniu możesz ręcznie poprawić START/KONIEC. Dokładność przy śpiewie zależy od tego, jak dobrze model rozpozna wokal w miksie.",14));
         timeline=new LinearLayout(this); timeline.setOrientation(LinearLayout.VERTICAL); body.addView(timeline);
         for(int i=0;i<project.lyrics.size();i++) lineCard(i);
@@ -171,6 +175,45 @@ public class MainActivity extends Activity {
                 new AlertDialog.Builder(MainActivity.this).setTitle("Auto timing").setMessage(m).setPositiveButton("OK",null).show();
             }
         });
+    }
+
+    void showOnePointCalibration(){
+        if(project.lyrics.isEmpty()){Toast.makeText(this,"Brak fragmentów",Toast.LENGTH_SHORT).show();return;}
+        LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(24,8,24,8);
+        EditText line=num(1d), actual=num(project.lyrics.get(0).start==null?0d:project.lyrics.get(0).start);
+        box.addView(txt("Numer fragmentu",14)); box.addView(line); box.addView(txt("Prawidłowy START tej linijki (s)",14)); box.addView(actual);
+        new AlertDialog.Builder(this).setTitle("Kalibracja 1 punkt").setView(box).setPositiveButton("Przelicz",(d,w)->{
+            Double ln=parse(line), real=parse(actual); if(ln==null||real==null){Toast.makeText(this,"Nieprawidłowe dane",Toast.LENGTH_SHORT).show();return;}
+            int idx=(int)Math.round(ln)-1; if(idx<0||idx>=project.lyrics.size()||project.lyrics.get(idx).start==null){Toast.makeText(this,"Ta linia nie ma czasu START",Toast.LENGTH_LONG).show();return;}
+            double old=project.lyrics.get(idx).start; double off=real-old; applyOffset(off);
+            Toast.makeText(this,"Przesunięto wszystkie czasy o "+String.format(Locale.US,"%+.3f s",off),Toast.LENGTH_LONG).show(); timingTab();
+        }).setNegativeButton("Anuluj",null).show();
+    }
+
+    void showTwoPointCalibration(){
+        if(project.lyrics.size()<2){Toast.makeText(this,"Potrzeba co najmniej 2 fragmentów",Toast.LENGTH_SHORT).show();return;}
+        LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(24,8,24,8);
+        EditText line1=num(1d), real1=num(project.lyrics.get(0).start==null?0d:project.lyrics.get(0).start);
+        EditText line2=num((double)project.lyrics.size()), real2=num(project.lyrics.get(project.lyrics.size()-1).start==null?0d:project.lyrics.get(project.lyrics.size()-1).start);
+        box.addView(txt("Punkt 1 — numer fragmentu",14)); box.addView(line1); box.addView(txt("Prawidłowy START punktu 1 (s)",14)); box.addView(real1);
+        box.addView(txt("Punkt 2 — numer fragmentu",14)); box.addView(line2); box.addView(txt("Prawidłowy START punktu 2 (s)",14)); box.addView(real2);
+        new AlertDialog.Builder(this).setTitle("Kalibracja 2 punkty").setView(box).setPositiveButton("Przelicz",(d,w)->{
+            Double a=parse(line1), ra=parse(real1), b=parse(line2), rb=parse(real2); if(a==null||ra==null||b==null||rb==null){Toast.makeText(this,"Nieprawidłowe dane",Toast.LENGTH_SHORT).show();return;}
+            int i1=(int)Math.round(a)-1, i2=(int)Math.round(b)-1;
+            if(i1<0||i2<0||i1>=project.lyrics.size()||i2>=project.lyrics.size()||i1==i2){Toast.makeText(this,"Wybierz dwa różne poprawne numery fragmentów",Toast.LENGTH_LONG).show();return;}
+            Double old1=project.lyrics.get(i1).start, old2=project.lyrics.get(i2).start; if(old1==null||old2==null||Math.abs(old2-old1)<0.01){Toast.makeText(this,"Wybrane linie nie mają prawidłowych czasów START",Toast.LENGTH_LONG).show();return;}
+            double scale=(rb-ra)/(old2-old1); if(scale<0.90||scale>1.10){Toast.makeText(this,"Korekta byłaby zbyt duża. Sprawdź numery linii i czasy.",Toast.LENGTH_LONG).show();return;}
+            double shift=ra-scale*old1; applyAffine(scale,shift);
+            Toast.makeText(this,"Kalibracja zastosowana: skala "+String.format(Locale.US,"%.5f",scale)+", przesunięcie "+String.format(Locale.US,"%+.3f s",shift),Toast.LENGTH_LONG).show(); timingTab();
+        }).setNegativeButton("Anuluj",null).show();
+    }
+
+    void applyOffset(double offset){
+        for(LyricLine l:project.lyrics){ if(l.start!=null)l.start=Math.max(0,l.start+offset); if(l.end!=null)l.end=Math.max(0,l.end+offset); }
+    }
+
+    void applyAffine(double scale,double shift){
+        for(LyricLine l:project.lyrics){ if(l.start!=null)l.start=Math.max(0,l.start*scale+shift); if(l.end!=null)l.end=Math.max(0,l.end*scale+shift); }
     }
 
     void lineCard(int i){
