@@ -7,6 +7,9 @@ import java.util.*;
 
 public class VisualizerView extends View {
     ProjectData project; double time;
+    static final double RANK_ANIM_SECONDS = 0.85;
+    static final double RANK_SAMPLE_STEP = 0.05;
+
     public VisualizerView(Context c){super(c);setBackgroundColor(Color.BLACK);}
     public void setProject(ProjectData p){project=p;invalidate();}
     public void setTime(double t){time=t;invalidate();}
@@ -36,22 +39,49 @@ public class VisualizerView extends View {
     static double singerTime(ProjectData pr,Singer singer,double t){double sec=0;for(LyricLine l:pr.lyrics){if(!l.singerIds.contains(singer.id)||l.start==null||l.end==null)continue;if(t>l.end)sec+=Math.max(0,l.end-l.start);else if(t>l.start)sec+=Math.max(0,t-l.start);}return sec;}
     static LinkedHashMap<Singer,Double> scoreMap(ProjectData pr,double t){LinkedHashMap<Singer,Double>m=new LinkedHashMap<>();for(Singer s:pr.singers)m.put(s,singerTime(pr,s,t));return m;}
     static int hardRank(Singer me,LinkedHashMap<Singer,Double> scores){int r=1;double mine=scores.get(me);for(Map.Entry<Singer,Double>e:scores.entrySet()){if(e.getKey()==me)continue;double other=e.getValue();if(other>mine+0.0001||(Math.abs(other-mine)<=0.0001&&e.getKey().id<me.id))r++;}return r;}
-    static double smoothRank(Singer me,LinkedHashMap<Singer,Double> scores){
-        double mine=scores.get(me);
-        if(mine<=0.0001){return hardRank(me,scores);}
-        double rank=1.0,softness=0.28;
-        for(Map.Entry<Singer,Double>e:scores.entrySet()){
-            if(e.getKey()==me)continue;double other=e.getValue();
-            if(other<=0.0001){continue;}
-            double diff=other-mine;
-            if(Math.abs(diff)<=0.0001){if(e.getKey().id<me.id)rank+=1.0;continue;}
-            double d=diff/softness;
-            if(d>8)rank+=1.0;else if(d<-8)rank+=0.0;else rank+=1.0/(1.0+Math.exp(-d));
-        }
-        int zeroAhead=0;for(Map.Entry<Singer,Double>e:scores.entrySet())if(e.getKey()!=me&&e.getValue()<=0.0001&&e.getKey().id<me.id&&mine<=0.0001)zeroAhead++;
-        return rank+zeroAhead;
+    static int hardRankAt(ProjectData pr,Singer singer,double t){return hardRank(singer,scoreMap(pr,Math.max(0,t)));}
+
+    static double easeInOut(double x){
+        x=Math.max(0.0,Math.min(1.0,x));
+        return x*x*(3.0-2.0*x);
     }
-    static float sideShift(double smoothRank,int singerId){double frac=Math.abs(smoothRank-Math.rint(smoothRank));if(frac<0.03)return 0;double strength=Math.sin(Math.PI*Math.min(1.0,frac*2.0));return(float)((singerId%2==0?1:-1)*70.0*strength);}
+
+    // Znajduje ostatni moment zmiany miejsca wokalisty i animuje przejście
+    // przez stały czas. Dzięki temu animacja kończy się nawet jeśli w tym
+    // momencie nikt już nie śpiewa i czasy przestały rosnąć.
+    static double animatedRank(ProjectData pr,Singer singer,double t){
+        int current=hardRankAt(pr,singer,t);
+        if(t<=0)return current;
+
+        double searchFrom=Math.max(0,t-RANK_ANIM_SECONDS-0.25);
+        int previous=hardRankAt(pr,singer,searchFrom);
+        double lastChange=-1;
+        int rankBefore=previous;
+        int lastSeen=previous;
+
+        for(double ts=searchFrom+RANK_SAMPLE_STEP;ts<=t+0.0001;ts+=RANK_SAMPLE_STEP){
+            int r=hardRankAt(pr,singer,Math.min(ts,t));
+            if(r!=lastSeen){
+                double lo=Math.max(searchFrom,ts-RANK_SAMPLE_STEP),hi=Math.min(ts,t);
+                int before=lastSeen;
+                for(int i=0;i<10;i++){
+                    double mid=(lo+hi)/2.0;
+                    if(hardRankAt(pr,singer,mid)==before)lo=mid;else hi=mid;
+                }
+                lastChange=hi;
+                rankBefore=before;
+                lastSeen=r;
+            }
+        }
+
+        if(lastChange<0 || current==rankBefore)return current;
+        double progress=(t-lastChange)/RANK_ANIM_SECONDS;
+        if(progress>=1.0)return current;
+        double eased=easeInOut(progress);
+        return rankBefore+(current-rankBefore)*eased;
+    }
+
+    static float sideShift(double animatedRank,int singerId){double frac=Math.abs(animatedRank-Math.rint(animatedRank));if(frac<0.02)return 0;double strength=Math.sin(Math.PI*Math.min(1.0,frac*2.0));return(float)((singerId%2==0?1:-1)*58.0*strength);}
 
     static void drawScene(Canvas c,ProjectData pr,double t){
         Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);c.drawColor(Color.rgb(5,5,5));
@@ -75,8 +105,8 @@ public class VisualizerView extends View {
         LinkedHashMap<Singer,Double>scores=scoreMap(pr,t);double total=0;for(double v:scores.values())total+=v;
         final float baseY=1235f,rowGap=98f;
         for(Singer s:pr.singers){
-            double sec=scores.get(s),pct=total>0?sec/total:0,sr=smoothRank(s,scores);int rank=hardRank(s,scores);float y=(float)(baseY+(sr-1.0)*rowGap);if(y<1190||y>1840)continue;
-            float shift=sideShift(sr,s.id);c.save();c.translate(shift,0);
+            double sec=scores.get(s),pct=total>0?sec/total:0,ar=animatedRank(pr,s,t);int rank=hardRank(s,scores);float y=(float)(baseY+(ar-1.0)*rowGap);if(y<1190||y>1840)continue;
+            float shift=sideShift(ar,s.id);c.save();c.translate(shift,0);
             drawAvatar(c,p,s,88,y-38,62);p.setTextAlign(Paint.Align.LEFT);p.setTextSize(28);p.setColor(Color.WHITE);c.drawText(rank+". "+s.name,170,y,p);
             p.setTextAlign(Paint.Align.RIGHT);c.drawText(String.format(Locale.US,"%.1fs • %.1f%%",sec,pct*100),970,y,p);
             p.setColor(Color.argb(175,55,55,55));c.drawRoundRect(170,y+18,810,y+48,15,15,p);try{p.setColor(Color.parseColor(s.color));}catch(Exception e){p.setColor(Color.WHITE);}c.drawRoundRect(170,y+18,(float)(170+640*pct),y+48,15,15,p);c.restore();
