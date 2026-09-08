@@ -12,6 +12,7 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.Normalizer
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -27,6 +28,8 @@ object AutoTiming {
     }
 
     private data class TimedWord(val text: String, val startMs: Long, val endMs: Long)
+    private data class Match(val startWord: Int, val endWord: Int, val score: Double)
+    private data class Anchor(val line: Int, val startMs: Long, val endMs: Long, val score: Double, val forced: Boolean = false)
 
     @JvmStatic
     fun run(context: Context, project: ProjectData, listener: Listener) {
@@ -38,16 +41,26 @@ object AutoTiming {
             listener.onError("Najpierw wygeneruj fragmenty tekstu po kropkach.")
             return
         }
+
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val model = ensureModel(context, listener)
-                withContext(Dispatchers.Main) { listener.onStatus("Analizuję śpiew i dopasowuję tekst…") }
+                withContext(Dispatchers.Main) {
+                    listener.onStatus("Analizuję wokal. Szukam kotwic i układam wszystkie fragmenty po kolei…")
+                }
+
                 val whisperModel = Whisper.loadModel(context, model.absolutePath)
                 val threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 8)
                 val result = Whisper.transcribe(
                     whisperModel,
                     project.audioPath!!,
-                    WhisperConfig(language = "pl", translate = false, threads = threads, maxSegmentLength = 80, printTimestamps = true)
+                    WhisperConfig(
+                        language = "pl",
+                        translate = false,
+                        threads = threads,
+                        maxSegmentLength = 70,
+                        printTimestamps = true
+                    )
                 )
                 Whisper.releaseModel(whisperModel)
 
@@ -63,30 +76,178 @@ object AutoTiming {
                         if (n.isNotBlank()) words.add(TimedWord(n, s, e))
                     }
                 }
-                if (words.isEmpty()) throw IllegalStateException("Whisper nie rozpoznał słów w tym utworze.")
+                if (words.isEmpty()) throw IllegalStateException("Model nie rozpoznał żadnych słów w tym utworze.")
 
-                var cursor = 0
-                var scoreSum = 0.0
-                var matched = 0
-                project.lyrics.forEachIndexed { index, line ->
-                    val target = lyricTokens(line.text)
-                    if (target.isEmpty()) return@forEachIndexed
-                    val best = findBest(words, target, cursor)
-                    if (best != null) {
-                        line.start = words[best.first].startMs / 1000.0
-                        line.end = words[best.second].endMs / 1000.0
-                        cursor = max(cursor, best.second + 1)
-                        scoreSum += best.third
-                        matched++
-                    }
-                    withContext(Dispatchers.Main) { listener.onProgress(((index + 1) * 100) / project.lyrics.size) }
+                val lineTokens = project.lyrics.map { lyricTokens(it.text) }
+                val allOldFilled = project.lyrics.all { it.start != null && it.end != null }
+                val firstOld = project.lyrics.firstOrNull()?.start
+                val firstRecognizedSec = words.first().startMs / 1000.0
+
+                // A manually corrected first START is the strongest anchor. If the whole timeline was
+                // previously auto-filled and starts absurdly late, do not blindly trust that old result.
+                val anchorSec = when {
+                    firstOld != null && firstOld >= 0.0 && (!allOldFilled || firstOld <= 20.0) -> firstOld
+                    firstRecognizedSec <= 18.0 -> firstRecognizedSec
+                    else -> 8.0
                 }
-                val conf = if (matched == 0) 0.0 else scoreSum / matched
-                withContext(Dispatchers.Main) { listener.onDone(conf) }
+                val anchorMs = (anchorSec * 1000.0).toLong()
+
+                val anchors = ArrayList<Anchor>()
+                anchors.add(Anchor(0, anchorMs, anchorMs, 1.0, forced = true))
+
+                var expectedMs = anchorMs
+                var minWordIndex = words.indexOfFirst { it.endMs >= anchorMs }.let { if (it < 0) 0 else it }
+                var directMatches = 0
+                var directScore = 0.0
+
+                for (i in 1 until project.lyrics.size) {
+                    val target = lineTokens[i]
+                    if (target.isEmpty()) continue
+
+                    expectedMs += estimatedDurationMs(target) + 80L
+                    val best = findBestNear(words, target, minWordIndex, expectedMs)
+                    if (best != null && best.score >= 0.28) {
+                        val startMs = words[best.startWord].startMs
+                        val endMs = words[best.endWord].endMs
+
+                        // Prevent one bad Whisper guess from jumping tens of seconds ahead while several
+                        // lyric fragments are still waiting to be placed.
+                        val maxReasonableJump = 24_000L + estimatedDurationMs(target) * 2
+                        if (startMs <= expectedMs + maxReasonableJump) {
+                            anchors.add(Anchor(i, startMs, endMs, best.score))
+                            minWordIndex = best.endWord + 1
+                            expectedMs = endMs
+                            directMatches++
+                            directScore += best.score
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        listener.onProgress(((i + 1) * 70) / project.lyrics.size)
+                    }
+                }
+
+                // Keep only chronologically valid anchors. Repeated choruses often tempt speech models
+                // into matching the right words at the wrong occurrence.
+                val cleanAnchors = ArrayList<Anchor>()
+                var lastLine = -1
+                var lastTime = -1L
+                for (a in anchors.sortedBy { it.line }) {
+                    if (a.line > lastLine && a.startMs >= lastTime) {
+                        cleanAnchors.add(a)
+                        lastLine = a.line
+                        lastTime = max(a.startMs, a.endMs)
+                    }
+                }
+
+                // Fill every line between reliable anchors. Unknown lines are never skipped anymore.
+                for (aIndex in cleanAnchors.indices) {
+                    val a = cleanAnchors[aIndex]
+                    val next = cleanAnchors.getOrNull(aIndex + 1)
+                    if (!a.forced) {
+                        project.lyrics[a.line].start = a.startMs / 1000.0
+                        project.lyrics[a.line].end = max(a.startMs + 250L, a.endMs) / 1000.0
+                    }
+
+                    val fromLine = if (a.forced) a.line else a.line + 1
+                    val toLineExclusive = next?.line ?: project.lyrics.size
+                    if (fromLine >= toLineExclusive) continue
+
+                    val regionStart = if (a.forced) a.startMs else max(a.endMs + 60L, a.startMs)
+                    val weights = ArrayList<Long>()
+                    var totalWeight = 0L
+                    for (line in fromLine until toLineExclusive) {
+                        val w = estimatedDurationMs(lineTokens[line]).coerceAtLeast(850L)
+                        weights.add(w)
+                        totalWeight += w
+                    }
+
+                    val naturalEnd = regionStart + totalWeight + max(0, weights.size - 1) * 70L
+                    val regionEnd = if (next != null) {
+                        max(regionStart + weights.size * 450L, next.startMs - 80L)
+                    } else {
+                        val songEnd = if (project.songDuration > 0.0) (project.songDuration * 1000.0).toLong() else words.last().endMs
+                        min(songEnd, max(naturalEnd, words.last().endMs))
+                    }
+                    val available = max(600L * weights.size, regionEnd - regionStart)
+                    var cursor = regionStart
+
+                    for ((offset, line) in (fromLine until toLineExclusive).withIndex()) {
+                        val proportion = if (totalWeight <= 0L) 1.0 / weights.size else weights[offset].toDouble() / totalWeight.toDouble()
+                        val dur = max(500L, (available * proportion).toLong() - 55L)
+                        project.lyrics[line].start = cursor / 1000.0
+                        project.lyrics[line].end = (cursor + dur) / 1000.0
+                        cursor += dur + 55L
+                    }
+                }
+
+                // If the first line was forced and the loop above did not give it an end, ensure it has one.
+                if (project.lyrics[0].start == null) project.lyrics[0].start = anchorMs / 1000.0
+                if (project.lyrics[0].end == null || project.lyrics[0].end!! <= project.lyrics[0].start!!) {
+                    val nextStart = project.lyrics.getOrNull(1)?.start
+                    project.lyrics[0].end = if (nextStart != null && nextStart > project.lyrics[0].start!!) {
+                        max(project.lyrics[0].start!! + 0.5, nextStart - 0.055)
+                    } else {
+                        project.lyrics[0].start!! + estimatedDurationMs(lineTokens[0]) / 1000.0
+                    }
+                }
+
+                // Final monotonic safety pass: no overlaps caused by noisy anchors.
+                var lastEnd = anchorMs / 1000.0
+                for (line in project.lyrics) {
+                    var s = line.start ?: lastEnd
+                    var e = line.end ?: (s + 1.0)
+                    if (s < lastEnd - 0.02) s = lastEnd + 0.02
+                    if (e <= s + 0.20) e = s + 0.55
+                    line.start = s
+                    line.end = e
+                    lastEnd = e
+                }
+
+                val conf = if (directMatches == 0) 0.0 else (directScore / directMatches) * (directMatches.toDouble() / max(1, project.lyrics.size - 1))
+                withContext(Dispatchers.Main) {
+                    listener.onProgress(100)
+                    listener.onStatus(
+                        "Gotowe. Bezpośrednio rozpoznano $directMatches/${project.lyrics.size} fragmentów; resztę ułożono sekwencyjnie od ${String.format("%.3f", anchorSec)} s."
+                    )
+                    listener.onDone(conf.coerceIn(0.0, 1.0))
+                }
             } catch (t: Throwable) {
-                withContext(Dispatchers.Main) { listener.onError(t.javaClass.simpleName + ": " + (t.message ?: "nieznany błąd")) }
+                withContext(Dispatchers.Main) {
+                    listener.onError(t.javaClass.simpleName + ": " + (t.message ?: "nieznany błąd"))
+                }
             }
         }
+    }
+
+    private fun estimatedDurationMs(tokens: List<String>): Long {
+        if (tokens.isEmpty()) return 1200L
+        // Rap is commonly 2.3–3.2 words/s. This is only a fallback between AI anchors.
+        return (tokens.size * 390L).coerceIn(900L, 6500L)
+    }
+
+    private fun findBestNear(words: List<TimedWord>, target: List<String>, minIndex: Int, expectedMs: Long): Match? {
+        if (minIndex >= words.size || target.isEmpty()) return null
+        val startIndex = max(0, minIndex)
+        var best: Match? = null
+        val searchEndMs = expectedMs + 28_000L
+        var s = startIndex
+        while (s < words.size && words[s].startMs <= searchEndMs) {
+            if (words[s].endMs < expectedMs - 4_000L) { s++; continue }
+            val targetN = target.size
+            val minLen = max(1, targetN - max(3, targetN / 2))
+            val maxLen = min(words.size - s, targetN + max(5, targetN / 2))
+            for (len in minLen..maxLen) {
+                val end = s + len - 1
+                val candidate = ArrayList<String>(len)
+                for (i in s..end) candidate.add(words[i].text)
+                val lexical = similarity(target, candidate)
+                val timePenalty = min(0.18, abs(words[s].startMs - expectedMs).toDouble() / 90_000.0)
+                val score = lexical - timePenalty
+                if (best == null || score > best!!.score) best = Match(s, end, score)
+            }
+            s++
+        }
+        return best
     }
 
     private suspend fun ensureModel(context: Context, listener: Listener): File {
@@ -99,7 +260,7 @@ object AutoTiming {
         conn.instanceFollowRedirects = true
         conn.connectTimeout = 20_000
         conn.readTimeout = 60_000
-        conn.setRequestProperty("User-Agent", "SingerStatsVisualizer/1.5")
+        conn.setRequestProperty("User-Agent", "SingerStatsVisualizer/1.6")
         conn.connect()
         if (conn.responseCode !in 200..299) throw IllegalStateException("Nie udało się pobrać modelu: HTTP ${conn.responseCode}")
         val total = conn.contentLengthLong
@@ -136,32 +297,9 @@ object AutoTiming {
         .filter { it.isNotBlank() }
 
     private fun normToken(s: String): String {
-        val x = Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "")
-        return x.replace(Regex("[^a-z0-9ąćęłńóśźż]"), "")
-    }
-
-    private fun findBest(words: List<TimedWord>, target: List<String>, cursor: Int): Triple<Int, Int, Double>? {
-        if (cursor >= words.size) return null
-        val targetN = target.size
-        var bestStart = cursor
-        var bestEnd = min(words.lastIndex, cursor + max(1, targetN) - 1)
-        var bestScore = -1.0
-        val startMax = min(words.lastIndex, cursor + max(35, targetN * 3))
-        for (s in cursor..startMax) {
-            val minLen = max(1, targetN - max(3, targetN / 2))
-            val maxLen = min(words.size - s, targetN + max(5, targetN / 2))
-            for (len in minLen..maxLen) {
-                val candidate = ArrayList<String>(len)
-                for (i in 0 until len) candidate.add(words[s + i].text)
-                val sc = similarity(target, candidate) - (s - cursor) * 0.002
-                if (sc > bestScore) {
-                    bestScore = sc
-                    bestStart = s
-                    bestEnd = s + len - 1
-                }
-            }
-        }
-        return Triple(bestStart, bestEnd, bestScore.coerceIn(0.0, 1.0))
+        val x = Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD)
+            .replace(Regex("\\p{Mn}+"), "")
+        return x.replace(Regex("[^a-z0-9]"), "")
     }
 
     private fun similarity(a: List<String>, b: List<String>): Double {
@@ -170,9 +308,19 @@ object AutoTiming {
         for (i in 0..a.size) dp[i][0] = i
         for (j in 0..b.size) dp[0][j] = j
         for (i in 1..a.size) for (j in 1..b.size) {
-            val cost = if (a[i - 1] == b[j - 1]) 0 else 1
-            dp[i][j] = minOf(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+            val cost = tokenCost(a[i - 1], b[j - 1])
+            dp[i][j] = minOf(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
+            )
         }
         return 1.0 - dp[a.size][b.size].toDouble() / max(a.size, b.size).toDouble()
+    }
+
+    private fun tokenCost(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.length >= 4 && b.length >= 4 && (a.startsWith(b.take(4)) || b.startsWith(a.take(4)))) return 0
+        return 1
     }
 }
