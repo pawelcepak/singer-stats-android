@@ -21,24 +21,38 @@ public class VisualizerView extends View {
         float z=Math.max(w/(float)src.getWidth(),h/(float)src.getHeight());
         Bitmap scaled=Bitmap.createScaledBitmap(src,Math.round(src.getWidth()*z),Math.round(src.getHeight()*z),true);
         int x=Math.max(0,(scaled.getWidth()-w)/2),y=Math.max(0,(scaled.getHeight()-h)/2);
-        return Bitmap.createBitmap(scaled,x,y,Math.min(w,scaled.getWidth()-x),Math.min(h,scaled.getHeight()-y));
+        Bitmap result=Bitmap.createBitmap(scaled,x,y,Math.min(w,scaled.getWidth()-x),Math.min(h,scaled.getHeight()-y));
+        if(scaled!=src)src.recycle();
+        if(result!=scaled)scaled.recycle();
+        return result;
     }
     public static Bitmap render(ProjectData p,double t){
         Bitmap b=Bitmap.createBitmap(1080,1920,Bitmap.Config.ARGB_8888);drawScene(new Canvas(b),p,t);return b;
     }
+    public static Bitmap renderLowMemory(ProjectData p,double t){
+        Bitmap b=Bitmap.createBitmap(540,960,Bitmap.Config.ARGB_8888);
+        Canvas c=new Canvas(b);c.scale(0.5f,0.5f);drawScene(c,p,t);return b;
+    }
+    static LyricLine activeLine(ProjectData pr,double t){
+        LyricLine active=null;double latest=-1;
+        for(LyricLine l:pr.lyrics){
+            if(l.start!=null&&l.end!=null&&t>=l.start&&t<=l.end&&l.start>=latest){active=l;latest=l.start;}
+        }
+        return active;
+    }
     static void drawScene(Canvas c,ProjectData pr,double t){
         Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);c.drawColor(Color.rgb(5,5,5));
-        Bitmap cover=crop(pr.coverPath,1080,1920);if(cover!=null){c.drawBitmap(cover,0,0,p);p.setColor(Color.argb(120,0,0,0));c.drawRect(0,0,1080,1920,p);}
+        Bitmap cover=crop(pr.coverPath,1080,1920);if(cover!=null){c.drawBitmap(cover,0,0,p);cover.recycle();p.setColor(Color.argb(120,0,0,0));c.drawRect(0,0,1080,1920,p);}
         p.setTextAlign(Paint.Align.CENTER);p.setColor(Color.WHITE);p.setTextSize(54);p.setFakeBoldText(true);c.drawText("KTO ILE ŚPIEWA?",540,105,p);
         p.setTextSize(38);p.setFakeBoldText(false);c.drawText(fmt(t),540,165,p);
-        LyricLine active=null;for(LyricLine l:pr.lyrics)if(l.start!=null&&l.end!=null&&t>=l.start&&t<=l.end){active=l;break;}
+        LyricLine active=activeLine(pr,t);
         if(active!=null){
             p.setStyle(Paint.Style.FILL);p.setColor(Color.argb(155,0,0,0));c.drawRoundRect(75,650,1005,1015,30,30,p);
             p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(7);try{p.setColor(Color.parseColor(pr.lyricsBorderColor));}catch(Exception e){p.setColor(0xffff0050);}c.drawRoundRect(75,650,1005,1015,30,30,p);p.setStyle(Paint.Style.FILL);
             ArrayList<Singer>a=new ArrayList<>();for(Singer s:pr.singers)if(active.singerIds.contains(s.id))a.add(s);
-            int x=120;for(Singer s:a){Bitmap av=crop(s.imagePath,88,88);RectF r=new RectF(x,690,x+88,778);if(av!=null)c.drawBitmap(av,null,r,p);else{try{p.setColor(Color.parseColor(s.color));}catch(Exception e){p.setColor(Color.GRAY);}c.drawOval(r,p);}x+=102;if(x>750)break;}
+            int x=120;for(Singer s:a){Bitmap av=crop(s.imagePath,88,88);RectF r=new RectF(x,690,x+88,778);if(av!=null){c.drawBitmap(av,null,r,p);av.recycle();}else{try{p.setColor(Color.parseColor(s.color));}catch(Exception e){p.setColor(Color.GRAY);}c.drawOval(r,p);}x+=102;if(x>750)break;}
             StringBuilder names=new StringBuilder();for(Singer s:a){if(names.length()>0)names.append(" + ");names.append(s.name.toUpperCase());}
-            p.setTextAlign(Paint.Align.LEFT);p.setTextSize(34);p.setFakeBoldText(true);p.setColor(a.isEmpty()?Color.WHITE:Color.parseColor(a.get(0).color));c.drawText(names.toString(),120,840,p);
+            p.setTextAlign(Paint.Align.LEFT);p.setTextSize(34);p.setFakeBoldText(true);try{p.setColor(a.isEmpty()?Color.WHITE:Color.parseColor(a.get(0).color));}catch(Exception e){p.setColor(Color.WHITE);}c.drawText(names.toString(),120,840,p);
             p.setFakeBoldText(false);p.setColor(Color.WHITE);p.setTextSize(44);wrap(c,p,active.text,120,920,830,52,2);
         }
         p.setTextAlign(Paint.Align.CENTER);p.setColor(Color.WHITE);p.setTextSize(34);p.setFakeBoldText(true);c.drawText("CZAS UTWORU  "+fmt(t),540,1160,p);c.drawText("STATYSTYKI CZASU",540,1260,p);p.setFakeBoldText(false);
