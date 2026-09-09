@@ -12,18 +12,29 @@ import java.util.*;
 
 public class VideoExporter {
     interface Listener{void progress(int p);void done(Uri u);void error(String e);}
+
     static void export(Context ctx,ProjectData pr,double from,double to,int fps,Listener li){
+        export(ctx,pr,from,to,fps,true,li);
+    }
+
+    static void export(Context ctx,ProjectData pr,double from,double to,int fps,boolean includeAudio,Listener li){
         new Thread(()->{
             String pipe=null;
             try{
                 if(pr.audioPath==null||!new File(pr.audioPath).exists())throw new Exception("Brak pliku audio.");
                 if(to<=from)throw new Exception("Nieprawidłowy zakres eksportu.");
-                File out=new File(ctx.getCacheDir(),"SingerStats_"+System.currentTimeMillis()+".mp4");
+                File out=new File(ctx.getCacheDir(),"SingerStats_"+(includeAudio?"audio_":"silent_")+System.currentTimeMillis()+".mp4");
                 pipe=FFmpegKitConfig.registerNewFFmpegPipe(ctx);
                 double dur=to-from;int frames=Math.max(1,(int)Math.ceil(dur*fps));
-                String cmd="-y -f rawvideo -pixel_format bgra -video_size 540x960 -framerate "+fps+
-                    " -i \""+pipe+"\" -ss "+String.format(Locale.US,"%.3f",from)+" -t "+String.format(Locale.US,"%.3f",dur)+
-                    " -i \""+pr.audioPath+"\" -map 0:v:0 -map 1:a:0 -vf scale=1080:1920:flags=lanczos -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart -shortest \""+out.getAbsolutePath()+"\"";
+                String cmd;
+                if(includeAudio){
+                    cmd="-y -f rawvideo -pixel_format bgra -video_size 540x960 -framerate "+fps+
+                        " -i \""+pipe+"\" -ss "+String.format(Locale.US,"%.3f",from)+" -t "+String.format(Locale.US,"%.3f",dur)+
+                        " -i \""+pr.audioPath+"\" -map 0:v:0 -map 1:a:0 -vf scale=1080:1920:flags=lanczos -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart -shortest \""+out.getAbsolutePath()+"\"";
+                }else{
+                    cmd="-y -f rawvideo -pixel_format bgra -video_size 540x960 -framerate "+fps+
+                        " -i \""+pipe+"\" -map 0:v:0 -vf scale=1080:1920:flags=lanczos -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -an -movflags +faststart \""+out.getAbsolutePath()+"\"";
+                }
                 final String pp=pipe;
                 FFmpegKit.executeAsync(cmd,session->{
                     try{
@@ -35,7 +46,7 @@ public class VideoExporter {
                 try(FileOutputStream fos=new FileOutputStream(pipe)){
                     ByteBuffer buf=ByteBuffer.allocate(540*960*4);
                     for(int i=0;i<frames;i++){
-                        Bitmap b=VisualizerView.renderLowMemory(pr,from+i/(double)fps);
+                        Bitmap b=TikTokSafeVisualizerView.renderLowMemory(pr,from+i/(double)fps);
                         buf.clear();b.copyPixelsToBuffer(buf);fos.write(buf.array(),0,buf.position());b.recycle();
                         if(i%Math.max(1,fps/2)==0)li.progress((i+1)*100/frames);
                     }
