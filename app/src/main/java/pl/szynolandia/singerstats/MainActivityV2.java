@@ -2,6 +2,7 @@ package pl.szynolandia.singerstats;
 
 import android.app.*;
 import android.os.*;
+import android.content.*;
 import android.graphics.*;
 import android.media.*;
 import android.net.*;
@@ -12,9 +13,89 @@ import java.util.regex.*;
 
 public class MainActivityV2 extends MainActivity {
     CheckBox includeAudioExport;
+    PreciseWaveformView preciseWave;
+    SeekBar waveZoom, wavePan;
+    Spinner waveLinePicker;
+    PublicationPlannerView publicationPlanner;
+    Handler parityHandler = new Handler();
 
     @Override public void onCreate(Bundle b){
-        super.onCreate(null);
+        super.onCreate(b);
+        try{
+            ViewGroup content=(ViewGroup)findViewById(android.R.id.content);
+            View first=content.getChildAt(0);
+            if(first instanceof LinearLayout){
+                LinearLayout root=(LinearLayout)first;
+                if(root.getChildCount()>0 && root.getChildAt(0) instanceof TextView)
+                    ((TextView)root.getChildAt(0)).setText("Singer Stats Visualizer 2.1 — Platform Parity");
+                if(root.getChildCount()>1 && root.getChildAt(1) instanceof LinearLayout){
+                    LinearLayout nav=(LinearLayout)root.getChildAt(1);
+                    Button pub=btn("Publikacje");
+                    nav.addView(pub);
+                    pub.setOnClickListener(v->publicationTab());
+                }
+            }
+        }catch(Exception ignored){}
+        parityHandler.post(parityTick);
+    }
+
+    Runnable parityTick=new Runnable(){ public void run(){
+        try{
+            if(preciseWave!=null && player!=null){
+                preciseWave.setCursor(player.getCurrentPosition()/1000.0);
+                if(wavePan!=null && !preciseWave.isTouching()){
+                    double max=Math.max(0,preciseWave.getDuration()-preciseWave.getViewSpan());
+                    if(max>0){int p=(int)Math.round(1000.0*preciseWave.getViewStart()/max);wavePan.setProgress(Math.max(0,Math.min(1000,p)));}
+                }
+            }
+        }catch(Exception ignored){}
+        parityHandler.postDelayed(this,50);
+    }};
+
+    @Override void timingTab(){
+        super.timingTab();
+        try{
+            int insertAt=body.indexOfChild(timeline);
+            if(insertAt<0) insertAt=Math.min(2,body.getChildCount());
+            LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(8,10,8,12); box.setBackgroundColor(Color.rgb(28,28,31));
+            box.addView(txt("Precyzyjny waveform / edycja 1 ms",17));
+            TextView hint=txt("Dotknij = ustaw kursor. Przeciągnij = zaznaczenie START–KONIEC. Suwak Zoom przybliża, suwak Przewiń przesuwa widok. To odpowiednik desktopowego edytora waveform.",13); box.addView(hint);
+
+            preciseWave=new PreciseWaveformView(this); preciseWave.setBackgroundColor(Color.rgb(15,15,18));
+            box.addView(preciseWave,new LinearLayout.LayoutParams(-1,dp(190)));
+            if(project.audioPath!=null) preciseWave.loadAudio(project.audioPath,project.songDuration);
+
+            LinearLayout zrow=row(); zrow.addView(txt("Zoom",13)); waveZoom=new SeekBar(this);waveZoom.setMax(1000);waveZoom.setProgress(220);zrow.addView(waveZoom,new LinearLayout.LayoutParams(0,-2,1));box.addView(zrow);
+            waveZoom.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onProgressChanged(SeekBar s,int p,boolean from){if(preciseWave!=null)preciseWave.setZoom(p/1000f);}public void onStartTrackingTouch(SeekBar s){}public void onStopTrackingTouch(SeekBar s){}});
+
+            LinearLayout prow=row(); prow.addView(txt("Przewiń",13)); wavePan=new SeekBar(this);wavePan.setMax(1000);prow.addView(wavePan,new LinearLayout.LayoutParams(0,-2,1));box.addView(prow);
+            wavePan.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onProgressChanged(SeekBar s,int p,boolean from){if(from&&preciseWave!=null)preciseWave.setPan(p/1000f);}public void onStartTrackingTouch(SeekBar s){}public void onStopTrackingTouch(SeekBar s){}});
+
+            HorizontalScrollView hs=new HorizontalScrollView(this); LinearLayout fine=row();
+            int[] ds={-100,-10,-1,1,10,100}; String[] labs={"-100 ms","-10 ms","-1 ms","+1 ms","+10 ms","+100 ms"};
+            for(int i=0;i<ds.length;i++){final int d=ds[i];Button nb=btn(labs[i]);nb.setOnClickListener(v->nudgePrecise(d));fine.addView(nb);}hs.addView(fine);box.addView(hs);
+
+            waveLinePicker=new Spinner(this); ArrayList<String> opts=new ArrayList<>();
+            for(int i=0;i<project.lyrics.size();i++){String s=project.lyrics.get(i).text; if(s.length()>44)s=s.substring(0,44)+"…";opts.add((i+1)+". "+s);}
+            ArrayAdapter<String> ad=new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,opts);waveLinePicker.setAdapter(ad);box.addView(waveLinePicker);
+
+            LinearLayout b1=row(); Button setS=btn("START = kursor"), setE=btn("KONIEC = kursor");b1.addView(setS);b1.addView(setE);box.addView(b1);
+            Button apply=btn("START/KONIEC = zaznaczenie waveform");box.addView(apply);
+            setS.setOnClickListener(v->setWaveBoundary(true)); setE.setOnClickListener(v->setWaveBoundary(false)); apply.setOnClickListener(v->applyWaveSelection());
+            body.addView(box,insertAt);
+        }catch(Exception e){body.addView(txt("Waveform: "+e.getMessage(),12),0);}
+    }
+
+    int dp(int x){return (int)(x*getResources().getDisplayMetrics().density+0.5f);}
+    int selectedWaveLine(){return waveLinePicker==null?-1:waveLinePicker.getSelectedItemPosition();}
+    void nudgePrecise(int deltaMs){if(player==null)return;if(player.isPlaying())player.pause();seek(deltaMs);if(preciseWave!=null)preciseWave.setCursor(now());}
+    void setWaveBoundary(boolean start){int i=selectedWaveLine();if(i<0||i>=project.lyrics.size()){Toast.makeText(this,"Wybierz linijkę",Toast.LENGTH_SHORT).show();return;}LyricLine l=project.lyrics.get(i);double t=preciseWave==null?now():preciseWave.getCursor();if(start)l.start=t;else l.end=t;Toast.makeText(this,(start?"START":"KONIEC")+" = "+f(t)+" s",Toast.LENGTH_SHORT).show();timingTab();}
+    void applyWaveSelection(){int i=selectedWaveLine();if(i<0||i>=project.lyrics.size()){Toast.makeText(this,"Wybierz linijkę",Toast.LENGTH_SHORT).show();return;}if(preciseWave==null||!preciseWave.hasSelection()){Toast.makeText(this,"Najpierw przeciągnij po waveformie",Toast.LENGTH_SHORT).show();return;}double[] s=preciseWave.getSelection();LyricLine l=project.lyrics.get(i);l.start=s[0];l.end=s[1];Toast.makeText(this,"Ustawiono START/KONIEC",Toast.LENGTH_SHORT).show();timingTab();}
+
+    void publicationTab(){
+        clear();
+        publicationPlanner=new PublicationPlannerView(this,()->project==null?"":project.songTitle);
+        body.addView(publicationPlanner,new LinearLayout.LayoutParams(-1,-2));
     }
 
     @Override void previewTab(){
@@ -83,4 +164,12 @@ public class MainActivityV2 extends MainActivity {
         }
         timingTab();
     }
+
+    void openCsvForPlanner(){open("text/*",60);}
+    @Override protected void onActivityResult(int req,int res,Intent data){
+        if(req==60){if(res==RESULT_OK&&data!=null&&data.getData()!=null&&publicationPlanner!=null)publicationPlanner.importCsv(data.getData());return;}
+        super.onActivityResult(req,res,data);
+    }
+
+    @Override protected void onDestroy(){parityHandler.removeCallbacksAndMessages(null);super.onDestroy();}
 }
