@@ -1,5 +1,6 @@
 package pl.szynolandia.singerstats;
 
+import android.app.*;
 import android.content.*;
 import android.graphics.*;
 import android.net.*;
