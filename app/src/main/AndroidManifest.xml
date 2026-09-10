@@ -5,7 +5,7 @@
         android:label="Singer Stats Visualizer"
         android:theme="@style/AppTheme">
         <activity
-            android:name=".MainActivityV22"
+            android:name=".MainActivityV23"
             android:screenOrientation="portrait"
             android:exported="true">
             <intent-filter>
